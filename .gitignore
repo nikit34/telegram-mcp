@@ -201,3 +201,5 @@ sticker.webp
 two.png
 aliases.json
 incoming_feed.jsonl
+session_debug.log
+session_instances.json

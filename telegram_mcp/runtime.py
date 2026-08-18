@@ -57,6 +57,7 @@ from functools import wraps
 import telethon.errors.rpcerrorlist
 from sanitize import sanitize_user_content, sanitize_name, sanitize_dict, format_tool_result
 from telegram_mcp.client_identity import client_identity_kwargs
+from telegram_mcp import session_diag
 
 
 class ValidationError(Exception):
@@ -409,6 +410,10 @@ def _acquire_session(pool: List[str]) -> str:
     )
 
 
+# label -> short fingerprint of the session backing it, for diagnostics only.
+SESSION_FINGERPRINTS: dict[str, str] = {}
+
+
 def _discover_accounts() -> dict[str, TelegramClient]:
     """Scan env vars to build account label -> TelegramClient mapping.
 
@@ -432,9 +437,11 @@ def _discover_accounts() -> dict[str, TelegramClient]:
         if key.startswith(prefix_str) and value:
             label = key[len(prefix_str) :].lower()
             accounts[label] = _build_client(StringSession(value), label)
+            SESSION_FINGERPRINTS[label] = session_diag.fingerprint(value)
         elif key.startswith(prefix_name) and value:
             label = key[len(prefix_name) :].lower()
             accounts[label] = _build_client(value, label)
+            SESSION_FINGERPRINTS[label] = f"file:{value}"
 
     # Backward-compatible unsuffixed variables. A pool (TELEGRAM_SESSION_STRINGS)
     # takes precedence for the default account and claims a free session slot.
@@ -444,13 +451,15 @@ def _discover_accounts() -> dict[str, TelegramClient]:
 
     if "default" not in accounts:
         if session_pool:
-            accounts["default"] = _build_client(
-                StringSession(_acquire_session(session_pool)), "default"
-            )
+            claimed = _acquire_session(session_pool)
+            accounts["default"] = _build_client(StringSession(claimed), "default")
+            SESSION_FINGERPRINTS["default"] = session_diag.fingerprint(claimed)
         elif session_string:
             accounts["default"] = _build_client(StringSession(session_string), "default")
+            SESSION_FINGERPRINTS["default"] = session_diag.fingerprint(session_string)
         elif session_name:
             accounts["default"] = _build_client(session_name, "default")
+            SESSION_FINGERPRINTS["default"] = f"file:{session_name}"
 
     if not accounts:
         print(
@@ -464,6 +473,24 @@ def _discover_accounts() -> dict[str, TelegramClient]:
 
 
 clients: dict[str, TelegramClient] = _discover_accounts()
+
+# Record this process against its sessions and shout if another live process
+# already holds one of them: that is what revokes an auth key.
+_rivals = session_diag.register_instance(SESSION_FINGERPRINTS)
+session_diag.event(
+    "process_start",
+    labels=list(clients.keys()),
+    fingerprints=SESSION_FINGERPRINTS,
+    rivals=_rivals,
+    executable=sys.executable,
+)
+if _rivals:
+    print(
+        f"WARNING: {len(_rivals)} other process(es) already use one of these Telegram "
+        f"sessions: {[r.get('pid') for r in _rivals]}. Telegram revokes an auth key "
+        "shared by two IPs; give each process its own session.",
+        file=sys.stderr,
+    )
 
 
 def get_client(account: str = None) -> TelegramClient:
@@ -531,20 +558,47 @@ _CONN_VERIFY_INTERVAL: float = 30.0  # seconds between live pings
 _RECONNECT_TIMEOUT: float = 30.0  # seconds before a reconnect attempt is abandoned
 
 
-async def _force_reconnect(cl: TelegramClient):
+def _label_for_client(cl: TelegramClient) -> str:
+    """Account label of a client, so diagnostics name the session, not an id."""
+    for label, candidate in clients.items():
+        if candidate is cl:
+            return label
+    return "unknown"
+
+
+async def _force_reconnect(cl: TelegramClient, reason: str = "unknown"):
     """Force disconnect + reconnect regardless of is_connected() state."""
     reconnect_logger = logging.getLogger("telegram_mcp")
     reconnect_logger.warning("Forcing reconnect...")
+    session_diag.event(
+        "reconnect_start",
+        reason=reason,
+        label=_label_for_client(cl),
+        before=session_diag.client_facts(cl),
+    )
+    started = time.time()
     try:
         await cl.disconnect()
     except Exception:
         pass
+
+    def _log_reconnect_failure(exc: BaseException) -> None:
+        session_diag.event(
+            "reconnect_failed",
+            reason=reason,
+            label=_label_for_client(cl),
+            error_type=type(exc).__name__,
+            error=str(exc)[:300],
+            elapsed=round(time.time() - started, 3),
+        )
+
     try:
         await asyncio.wait_for(cl.connect(), timeout=_RECONNECT_TIMEOUT)
     except AuthKeyDuplicatedError as exc:
         # Telegram permanently invalidates an auth key used from two IPs at
-        # once, so retrying here can never succeed — surface it instead of
+        # once, so retrying here can never succeed - surface it instead of
         # letting the caller sit in a reconnect loop.
+        _log_reconnect_failure(exc)
         raise RuntimeError(
             "Telegram session is no longer usable: the same session string was "
             "used by another client at the same time (AuthKeyDuplicatedError). "
@@ -553,14 +607,26 @@ async def _force_reconnect(cl: TelegramClient):
             "regenerate the burned session with `uv run session_string_generator.py`."
         ) from exc
     except asyncio.TimeoutError as exc:
+        _log_reconnect_failure(exc)
         raise RuntimeError(
             f"Reconnecting to Telegram timed out after {_RECONNECT_TIMEOUT:.0f}s."
         ) from exc
+    except Exception as exc:
+        _log_reconnect_failure(exc)
+        raise
     if not await cl.is_user_authorized():
         reconnect_logger.warning("Client not authorized after reconnect, calling start()...")
+        session_diag.event("reconnect_unauthorized", label=_label_for_client(cl))
         await asyncio.wait_for(cl.start(), timeout=_RECONNECT_TIMEOUT)
     _last_conn_verified[id(cl)] = time.time()
     reconnect_logger.warning("Forced reconnect successful")
+    session_diag.event(
+        "reconnect_ok",
+        reason=reason,
+        label=_label_for_client(cl),
+        elapsed=round(time.time() - started, 3),
+        after=session_diag.client_facts(cl),
+    )
 
 
 async def ensure_connected(cl: TelegramClient = None):
@@ -579,7 +645,7 @@ async def ensure_connected(cl: TelegramClient = None):
     key = id(cl)
 
     if not cl.is_connected():
-        await _force_reconnect(cl)
+        await _force_reconnect(cl, reason="not_connected")
         return
 
     # Skip verification if recently confirmed alive
@@ -594,8 +660,17 @@ async def ensure_connected(cl: TelegramClient = None):
             timeout=5.0,
         )
         _last_conn_verified[key] = now
-    except (ConnectionError, OSError, asyncio.TimeoutError, Exception):
-        await _force_reconnect(cl)
+    except (ConnectionError, OSError, asyncio.TimeoutError, Exception) as exc:
+        # The blanket except used to hide *why* the ping failed, which is the
+        # one fact that separates a dead socket from a revoked auth key.
+        session_diag.event(
+            "healthcheck_failed",
+            label=_label_for_client(cl),
+            error_type=type(exc).__name__,
+            error=str(exc)[:300],
+            facts=session_diag.client_facts(cl),
+        )
+        await _force_reconnect(cl, reason=f"healthcheck:{type(exc).__name__}")
 
 
 # Setup robust logging with both file and console output
